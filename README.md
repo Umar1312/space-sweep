@@ -8,7 +8,7 @@ python3 space_sweep.py
 
 Shows free space, a breakdown of removable categories (Xcode data, simulators, caches, Flutter build output, Android SDK extras, local models, wallpapers, app profiles), and lets you clean one category or run a one-touch cleanup.
 
-- Every deletion needs a typed confirmation (`CLEAN`, or `DELETE PROFILE DATA` for app profiles).
+- Every deletion needs a confirmation: press Enter to continue, anything else cancels.
 - Simulators: pick which to delete from a list (last used is kept by default); one-touch keeps only the last used.
 - App profiles are never included in one-touch cleanup.
 - Paths are hardcoded for one machine (e.g. `~/Developer/Mobile`); edit `categories()` to fit yours.

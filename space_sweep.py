@@ -446,9 +446,12 @@ def render(items: list[Category]) -> dict[str, Category]:
     return lookup
 
 
-def confirm(message: str, phrase: str = "CLEAN") -> bool:
-    answer = input(f"\n{message}\nType {color(phrase, YELLOW)} to continue: ").strip()
-    return answer == phrase
+def confirm(message: str, warning: bool = False) -> bool:
+    tone = RED if warning else YELLOW
+    answer = input(
+        f"\n{message}\nPress {color('Enter', tone)} to continue, or type anything else to cancel: "
+    )
+    return answer.strip() == ""
 
 
 def clean_category(item: Category) -> None:
@@ -457,9 +460,9 @@ def clean_category(item: Category) -> None:
         print(color("Nothing to clean in this category.", DIM))
         input("Press Enter to continue.")
         return
-    phrase = "CLEAN" if item.safe else "DELETE PROFILE DATA"
-    if not confirm(
-        f"Remove {bytes_to_text(size)} from {item.title}?\n{item.description}", phrase
+    if item.key != "simulators" and not confirm(
+        f"Remove {bytes_to_text(size)} from {item.title}?\n{item.description}",
+        warning=not item.safe,
     ):
         return
     cleaner = item.cleanup or direct_cleanup(item.paths)
