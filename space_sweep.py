@@ -126,6 +126,7 @@ class Category:
     paths: tuple[Path, ...]
     safe: bool = True
     cleanup: Callable[[], tuple[list[Path], list[str]]] | None = None
+    auto_cleanup: Callable[[], tuple[list[Path], list[str]]] | None = None
 
     def size(self) -> int:
         return sum(path_size(path) for path in self.paths)
@@ -151,57 +152,111 @@ def direct_cleanup(paths: tuple[Path, ...]) -> Callable[[], tuple[list[Path], li
     return clean
 
 
-def simulator_devices() -> list[tuple[Path, str, str, str]]:
+@dataclass(frozen=True)
+class Simulator:
+    folder: Path
+    udid: str
+    name: str
+    runtime: str
+    last_used: float
+
+    @property
+    def runtime_label(self) -> str:
+        return self.runtime.replace("com.apple.CoreSimulator.SimRuntime.", "")
+
+
+def simulator_devices() -> list[Simulator]:
+    """Installed simulators, most recently used first.
+
+    device.plist is rewritten whenever a device boots or shuts down, so its
+    modification time is the best "last used" signal available.
+    """
     root = HOME / "Library/Developer/CoreSimulator/Devices"
     devices = []
     for plist_path in root.glob("*/device.plist"):
         try:
             with plist_path.open("rb") as source:
                 info = plistlib.load(source)
+            last_used = plist_path.stat().st_mtime
         except (OSError, plistlib.InvalidFileException):
             continue
         devices.append(
-            (
+            Simulator(
                 plist_path.parent,
                 plist_path.parent.name,
                 info.get("name", "Unknown"),
                 info.get("runtime", "Unknown"),
+                last_used,
             )
         )
-    return devices
+    return sorted(devices, key=lambda device: device.last_used, reverse=True)
 
 
-def clean_simulators() -> tuple[list[Path], list[str]]:
-    devices = simulator_devices()
-    if not devices:
-        return [], ["No simulator devices were found."]
-
-    ios27 = [device for device in devices if "iOS-27" in device[3]]
-    keep = ios27[0] if ios27 else devices[0]
-    print(
-        f"\nKeeping {color(keep[2], GREEN)} — "
-        f"{keep[3].replace('com.apple.CoreSimulator.SimRuntime.', '')}"
-    )
-
+def delete_simulators(devices: list[Simulator]) -> tuple[list[Path], list[str]]:
     removed: list[Path] = []
     errors: list[str] = []
-    for folder, udid, name, _runtime in devices:
-        if udid == keep[1]:
-            continue
+    for device in devices:
         result = subprocess.run(
-            ["xcrun", "simctl", "delete", udid],
+            ["xcrun", "simctl", "delete", device.udid],
             text=True,
             capture_output=True,
             check=False,
         )
         if result.returncode == 0:
-            removed.append(folder)
+            removed.append(device.folder)
             continue
         errors.append(
-            f"{name}: Simulator service could not remove it "
+            f"{device.name}: Simulator service could not remove it "
             f"({result.stderr.strip() or 'unknown error'})"
         )
     return removed, errors
+
+
+def clean_simulators_auto() -> tuple[list[Path], list[str]]:
+    """Non-interactive: keep only the most recently used simulator."""
+    devices = simulator_devices()
+    if not devices:
+        return [], ["No simulator devices were found."]
+    return delete_simulators(devices[1:])
+
+
+def clean_simulators() -> tuple[list[Path], list[str]]:
+    """Interactive: the last used simulator is kept by default; toggle any others."""
+    devices = simulator_devices()
+    if not devices:
+        return [], ["No simulator devices were found."]
+
+    sizes = [path_size(device.folder) for device in devices]
+    keep = {0}
+    while True:
+        print(color("\nSIMULATORS", BOLD) + color("  (newest first)", DIM))
+        print(f"{'#':<4}{'DEVICE':<22}{'RUNTIME':<14}{'SIZE':>10}  {'LAST USED':<17} ACTION")
+        print(color(RULE, DIM))
+        for index, device in enumerate(devices):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(device.last_used))
+            action = color("KEEP", GREEN) if index in keep else color("DELETE", RED)
+            print(
+                f"{index + 1:<4}{device.name[:21]:<22}{device.runtime_label[:13]:<14}"
+                f"{bytes_to_text(sizes[index]):>10}  {when:<17} {action}"
+            )
+        doomed = [i for i in range(len(devices)) if i not in keep]
+        freed = sum(sizes[i] for i in doomed)
+        print(color(RULE, DIM))
+        print(f"Deleting {len(doomed)} of {len(devices)}, freeing {color(bytes_to_text(freed), YELLOW)}")
+        print(color("Numbers toggle keep/delete (e.g. 2 3) · [Enter] delete as shown · [q] cancel", DIM))
+        try:
+            answer = input(color("› ", PINK)).strip().lower()
+        except EOFError:
+            return [], []
+        if answer == "q":
+            return [], []
+        if answer == "":
+            if not doomed:
+                return [], []
+            return delete_simulators([devices[i] for i in doomed])
+        for token in answer.replace(",", " ").split():
+            if token.isdigit() and 1 <= int(token) <= len(devices):
+                keep ^= {int(token) - 1}
 
 
 def flutter_artifacts() -> tuple[Path, ...]:
@@ -254,9 +309,11 @@ def categories() -> list[Category]:
         Category(
             "simulators",
             "Simulator devices",
-            "Keeps one iOS 27 device (or one available device) and removes the rest.",
+            "Lets you pick which simulators to delete (default: keep the last used). "
+            "One-touch keeps only the last used.",
             (HOME / "Library/Developer/CoreSimulator/Devices",),
             cleanup=clean_simulators,
+            auto_cleanup=clean_simulators_auto,
         ),
         Category(
             "caches",
@@ -423,7 +480,7 @@ def one_touch(items: list[Category]) -> None:
         return
     errors: list[str] = []
     for item in safe:
-        cleaner = item.cleanup or direct_cleanup(item.paths)
+        cleaner = item.auto_cleanup or item.cleanup or direct_cleanup(item.paths)
         _removed, item_errors = cleaner()
         errors.extend(item_errors)
     print(color("One-touch cleanup finished.", GREEN))
