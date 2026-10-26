@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """A careful, dependency-free macOS disk-space inspector and cleaner.
 
 Run with: python3 space_sweep.py
@@ -5,6 +6,7 @@ Run with: python3 space_sweep.py
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -30,6 +32,36 @@ TEAL = "\x1b[38;5;80m"
 ORANGE = "\x1b[38;5;215m"
 GRAPH_COLORS = (PINK, BLUE, GREEN, YELLOW, PURPLE, TEAL, ORANGE)
 RULE = "─" * 64
+
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "space-sweep" / "config.json"
+DEFAULT_PROJECT_ROOTS = ("Developer", "Projects", "Code", "dev", "src", "workspace")
+SKIP_DIRS = {"node_modules", "Library", "Pods", ".git", ".Trash"}
+MAX_PROJECT_DEPTH = 3
+
+
+def expand(value: str) -> Path:
+    return Path(value).expanduser()
+
+
+def load_config() -> dict:
+    """Optional user settings from ~/.config/space-sweep/config.json.
+
+    {
+      "project_roots": ["~/work"],        # where to look for Flutter projects
+      "extra_paths": ["~/Movies/exports"],  # extra folders offered as safe to clean
+      "careful_paths": ["~/Library/Application Support/Foo"],  # never in one-touch
+      "exclude": ["wallpapers", "local-models"]   # category keys to hide
+    }
+    """
+    try:
+        with CONFIG_PATH.open() as source:
+            config = json.load(source)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as error:
+        print(color(f"Ignoring {CONFIG_PATH}: {error}", YELLOW))
+        return {}
+    return config if isinstance(config, dict) else {}
 
 
 def color(value: str, tone: str) -> str:
@@ -259,23 +291,37 @@ def clean_simulators() -> tuple[list[Path], list[str]]:
                 keep ^= {int(token) - 1}
 
 
-def flutter_artifacts() -> tuple[Path, ...]:
-    root = HOME / "Developer/Mobile"
-    if not root.exists():
-        return ()
-    targets = []
-    for project in root.iterdir():
-        if not project.is_dir():
-            continue
-        for name in ("build", ".dart_tool"):
-            target = project / name
-            if not target.exists():
-                continue
-            targets.append(target)
-    return tuple(targets)
+def flutter_artifacts(roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    """build/ and .dart_tool/ of every Flutter project found under the roots."""
+    targets: list[Path] = []
+
+    def walk(folder: Path, depth: int) -> None:
+        if (folder / "pubspec.yaml").exists():
+            targets.extend(
+                folder / name for name in ("build", ".dart_tool") if (folder / name).exists()
+            )
+            return
+        if depth >= MAX_PROJECT_DEPTH:
+            return
+        try:
+            children = sorted(folder.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if child.is_dir() and not child.is_symlink() and child.name not in SKIP_DIRS and not child.name.startswith("."):
+                walk(child, depth + 1)
+
+    for root in roots:
+        if root.is_dir():
+            walk(root, 0)
+    return tuple(dict.fromkeys(targets))
 
 
 def categories() -> list[Category]:
+    config = load_config()
+    roots = tuple(expand(r) for r in config.get("project_roots", ())) or tuple(
+        HOME / name for name in DEFAULT_PROJECT_ROOTS
+    )
     xcode_support = HOME / "Library/Developer/Xcode/iOS DeviceSupport"
     xcode_derived = HOME / "Library/Developer/Xcode/DerivedData"
     xcode_archives = HOME / "Library/Developer/Xcode/Archives"
@@ -285,15 +331,10 @@ def categories() -> list[Category]:
         HOME / "Library/Android/sdk/system-images",
         HOME / "Library/Android/sdk/emulator",
     )
-    profile_paths = (
-        HOME / "Library/Application Support/Notion",
-        HOME / "Library/Application Support/Cursor",
-        HOME / "Library/Application Support/Arc",
-        HOME / "Library/Application Support/Dia",
-        HOME / "Library/Application Support/Wondershare Filmora Mac",
-    )
+    extra_paths = tuple(expand(p) for p in config.get("extra_paths", ()))
+    careful_paths = tuple(expand(p) for p in config.get("careful_paths", ()))
 
-    return [
+    found = [
         Category(
             "xcode-support",
             "Xcode device support",
@@ -330,8 +371,8 @@ def categories() -> list[Category]:
         Category(
             "flutter",
             "Flutter build artifacts",
-            "build/ and .dart_tool/ in ~/Developer/Mobile projects.",
-            flutter_artifacts(),
+            "build/ and .dart_tool/ in Flutter projects found under your project folders.",
+            flutter_artifacts(roots),
         ),
         Category(
             "local-models",
@@ -351,14 +392,23 @@ def categories() -> list[Category]:
             "Downloaded Apple aerial video wallpapers.",
             (HOME / "Library/Application Support/com.apple.wallpaper/aerials",),
         ),
-        Category(
-            "profiles",
-            "App profiles",
-            "Notion, Cursor, Arc, Dia, and Filmora local profiles. May contain unsynced work.",
-            profile_paths,
-            safe=False,
-        ),
     ]
+    if extra_paths:
+        found.append(
+            Category("custom", "Custom folders", "Folders listed in extra_paths of your config.", extra_paths)
+        )
+    if careful_paths:
+        found.append(
+            Category(
+                "careful",
+                "Custom careful folders",
+                "Folders listed in careful_paths of your config. May contain unsynced work.",
+                careful_paths,
+                safe=False,
+            )
+        )
+    excluded = set(config.get("exclude", ()))
+    return [item for item in found if item.key not in excluded]
 
 
 def clear_screen() -> None:
@@ -442,7 +492,7 @@ def render(items: list[Category]) -> dict[str, Category]:
     safe_total = sum(size for item, size in measured if item.safe)
     print(color(RULE, DIM))
     print("Safe one-touch cleanup: " + color(bytes_to_text(safe_total), YELLOW))
-    print(color("Profiles are never included in one-touch cleanup.", DIM))
+    print(color("Categories marked ⚠ are never included in one-touch cleanup.", DIM))
     return lookup
 
 
