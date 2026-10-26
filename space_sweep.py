@@ -43,6 +43,29 @@ def expand(value: str) -> Path:
     return Path(value).expanduser()
 
 
+def is_too_broad(path: Path) -> bool:
+    """True for paths that must never be deleted wholesale (home, its parents, core folders)."""
+    resolved = path.resolve()
+    core = {HOME / name for name in ("Library", "Documents", "Desktop", "Applications")}
+    return resolved == Path(resolved.anchor) or resolved == HOME or resolved in HOME.parents or resolved in core
+
+
+def config_paths(config: dict, key: str) -> tuple[Path, ...]:
+    values = config.get(key, ())
+    if not isinstance(values, list):
+        return ()
+    paths = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        path = expand(value)
+        if is_too_broad(path):
+            print(color(f"Ignoring {value} in {key}: too broad to delete safely.", YELLOW))
+            continue
+        paths.append(path)
+    return tuple(paths)
+
+
 def load_config() -> dict:
     """Optional user settings from ~/.config/space-sweep/config.json.
 
@@ -157,6 +180,7 @@ class Category:
     description: str
     paths: tuple[Path, ...]
     safe: bool = True
+    contents_only: bool = False
     cleanup: Callable[[], tuple[list[Path], list[str]]] | None = None
     auto_cleanup: Callable[[], tuple[list[Path], list[str]]] | None = None
 
@@ -164,7 +188,18 @@ class Category:
         return sum(path_size(path) for path in self.paths)
 
 
-def direct_cleanup(paths: tuple[Path, ...]) -> Callable[[], tuple[list[Path], list[str]]]:
+def remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def direct_cleanup(
+    paths: tuple[Path, ...], contents_only: bool = False
+) -> Callable[[], tuple[list[Path], list[str]]]:
+    """Delete the paths, or only what is inside them so the folder itself survives."""
+
     def clean() -> tuple[list[Path], list[str]]:
         removed: list[Path] = []
         errors: list[str] = []
@@ -172,16 +207,24 @@ def direct_cleanup(paths: tuple[Path, ...]) -> Callable[[], tuple[list[Path], li
             if not path.exists():
                 continue
             try:
-                if path.is_dir() and not path.is_symlink():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink()
-                removed.append(path)
+                targets = list(path.iterdir()) if contents_only and path.is_dir() else [path]
             except OSError as error:
                 errors.append(f"{path}: {error.strerror or error}")
+                continue
+            for target in targets:
+                try:
+                    remove(target)
+                    removed.append(target)
+                except OSError as error:
+                    errors.append(f"{target}: {error.strerror or error}")
         return removed, errors
 
     return clean
+
+
+def cleaner_for(item: Category, automatic: bool = False) -> Callable[[], tuple[list[Path], list[str]]]:
+    custom = (item.auto_cleanup if automatic else None) or item.cleanup
+    return custom or direct_cleanup(item.paths, item.contents_only)
 
 
 @dataclass(frozen=True)
@@ -319,9 +362,7 @@ def flutter_artifacts(roots: tuple[Path, ...]) -> tuple[Path, ...]:
 
 def categories() -> list[Category]:
     config = load_config()
-    roots = tuple(expand(r) for r in config.get("project_roots", ())) or tuple(
-        HOME / name for name in DEFAULT_PROJECT_ROOTS
-    )
+    roots = config_paths(config, "project_roots") or tuple(HOME / name for name in DEFAULT_PROJECT_ROOTS)
     xcode_support = HOME / "Library/Developer/Xcode/iOS DeviceSupport"
     xcode_derived = HOME / "Library/Developer/Xcode/DerivedData"
     xcode_archives = HOME / "Library/Developer/Xcode/Archives"
@@ -331,8 +372,8 @@ def categories() -> list[Category]:
         HOME / "Library/Android/sdk/system-images",
         HOME / "Library/Android/sdk/emulator",
     )
-    extra_paths = tuple(expand(p) for p in config.get("extra_paths", ()))
-    careful_paths = tuple(expand(p) for p in config.get("careful_paths", ()))
+    extra_paths = config_paths(config, "extra_paths")
+    careful_paths = config_paths(config, "careful_paths")
 
     found = [
         Category(
@@ -344,8 +385,15 @@ def categories() -> list[Category]:
         Category(
             "xcode-derived",
             "Xcode build data",
-            "DerivedData and archived builds. Archives may contain distributable app builds.",
-            (xcode_derived, xcode_archives),
+            "DerivedData: intermediate build products Xcode regenerates.",
+            (xcode_derived,),
+        ),
+        Category(
+            "xcode-archives",
+            "Xcode archives",
+            "Archived app builds and their dSYMs. May be the only copy of a released build.",
+            (xcode_archives,),
+            safe=False,
         ),
         Category(
             "simulators",
@@ -359,8 +407,10 @@ def categories() -> list[Category]:
         Category(
             "caches",
             "Developer & app caches",
-            "Hugging Face, npm, browser, and general cache data. Safe to regenerate.",
+            "Contents of ~/.cache and ~/Library/Caches (Hugging Face, npm, browsers, app caches). "
+            "Apps rebuild them; some may redownload or sign in again.",
             cache_paths,
+            contents_only=True,
         ),
         Category(
             "android",
@@ -377,13 +427,13 @@ def categories() -> list[Category]:
         Category(
             "local-models",
             "Local AI models",
-            "LM Studio models and downloaded local model files.",
-            (HOME / ".lmstudio",),
+            "Models downloaded by LM Studio. Chats and settings are kept.",
+            (HOME / ".lmstudio/models",),
         ),
         Category(
             "dart",
             "Dart & Pub data",
-            "Dart analysis server and Pub package cache; recreated by Flutter/Dart.",
+            "Dart analysis server and Pub package cache. Globally activated Dart tools must be re-activated.",
             (HOME / ".dartServer", HOME / ".pub-cache"),
         ),
         Category(
@@ -473,7 +523,7 @@ def category_map(measured: list[tuple[Category, int]], width: int = 54) -> None:
     print()
 
 
-def render(items: list[Category]) -> dict[str, Category]:
+def render(items: list[Category]) -> tuple[dict[str, Category], dict[str, int]]:
     with ScanStatus():
         total, available = data_volume()
         measured = [(item, item.size()) for item in items]
@@ -493,7 +543,7 @@ def render(items: list[Category]) -> dict[str, Category]:
     print(color(RULE, DIM))
     print("Safe one-touch cleanup: " + color(bytes_to_text(safe_total), YELLOW))
     print(color("Categories marked ⚠ are never included in one-touch cleanup.", DIM))
-    return lookup
+    return lookup, {item.key: size for item, size in measured}
 
 
 def confirm(message: str, warning: bool = False) -> bool:
@@ -515,17 +565,16 @@ def clean_category(item: Category) -> None:
         warning=not item.safe,
     ):
         return
-    cleaner = item.cleanup or direct_cleanup(item.paths)
-    removed, errors = cleaner()
+    removed, errors = cleaner_for(item)()
     print(color(f"Removed {len(removed)} item(s).", GREEN))
     for error in errors:
         print(color(f"• {error}", RED))
     input("Press Enter to continue.")
 
 
-def one_touch(items: list[Category]) -> None:
-    safe = [item for item in items if item.safe and item.size()]
-    amount = sum(item.size() for item in safe)
+def one_touch(sizes: dict[str, int], items: list[Category]) -> None:
+    safe = [item for item in items if item.safe and sizes[item.key]]
+    amount = sum(sizes[item.key] for item in safe)
     if not confirm(
         f"One-touch cleanup will permanently remove {bytes_to_text(amount)} "
         f"across {len(safe)} safe categories."
@@ -533,8 +582,7 @@ def one_touch(items: list[Category]) -> None:
         return
     errors: list[str] = []
     for item in safe:
-        cleaner = item.auto_cleanup or item.cleanup or direct_cleanup(item.paths)
-        _removed, item_errors = cleaner()
+        _removed, item_errors = cleaner_for(item, automatic=True)()
         errors.extend(item_errors)
     print(color("One-touch cleanup finished.", GREEN))
     if errors:
@@ -550,22 +598,21 @@ def one_touch(items: list[Category]) -> None:
 def main() -> None:
     if sys.platform != "darwin":
         raise SystemExit("Space Sweep is designed for macOS.")
-    while True:
-        items = categories()
-        lookup = render(items)
-        print("\n[1–0] clean a category   [a] one-touch clean   [r] rescan   [q] quit")
-        try:
+    try:
+        while True:
+            items = categories()
+            lookup, sizes = render(items)
+            print(f"\n[1–{len(items)}] clean a category   [a] one-touch clean   [r] rescan   [q] quit")
             choice = input(color("› ", PINK)).strip().lower()
-        except EOFError:
-            print("\nDone. Stay spacious.\n")
-            return
-        if choice == "q":
-            print("\nDone. Stay spacious.\n")
-            return
-        if choice == "a":
-            one_touch(items)
-        elif choice in lookup:
-            clean_category(lookup[choice])
+            if choice == "q":
+                break
+            if choice == "a":
+                one_touch(sizes, items)
+            elif choice in lookup:
+                clean_category(lookup[choice])
+    except (EOFError, KeyboardInterrupt):
+        print()
+    print("\nDone. Stay spacious.\n")
 
 
 if __name__ == "__main__":
