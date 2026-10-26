@@ -2,7 +2,16 @@
 
 A dependency-free macOS disk-space inspector and cleaner, in one Python file.
 
-Requires macOS and Python 3.9+ (the system `python3` works).
+Requires macOS and Python 3.9+.
+
+## Install
+
+```bash
+brew install Umar1312/tap/space-sweep
+space-sweep
+```
+
+Or run the script directly:
 
 ```bash
 python3 space_sweep.py
